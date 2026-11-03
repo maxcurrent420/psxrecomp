@@ -179,6 +179,15 @@ static int crash_peek_guest(uint32_t vaddr, uint8_t *dst, int len) {
         memcpy(dst, g_psx_ram + folded, (size_t)len);
         return len;
     }
+    /* Mod arena: PSX_MOD_MEMORY_BASE (0x1F000000) .. +1 MiB. Mods allocate from
+     * this pool via psx_mod_alloc_guest_memory(), which hands back a KSEG0
+     * address (0x9F000000 + off). Read it back here so a mod's own state can be
+     * included in the run report. */
+    {
+        extern int psx_mod_memory_peek(uint32_t phys, uint8_t *dst, int len);
+        if (psx_mod_memory_peek(phys, dst, len) > 0)
+            return len;
+    }
     return 0;
 }
 
@@ -194,7 +203,17 @@ static void append_hex_bytes(char *buf, size_t cap, size_t *pos,
 
 static void append_ram_peek(char *buf, size_t cap, size_t *pos,
                             const char *key, uint32_t vaddr, int want, int comma) {
-    uint8_t tmp[64];
+    /* Grow the scratch buffer for large peeks (a 1024-slot capture ring is
+     * 110592 bytes). Kept on the heap and reused across calls. */
+    static uint8_t *tmp;
+    static int tmp_cap;
+    if (want > tmp_cap) {
+        int nc = want < 256 ? 256 : want;
+        uint8_t *nb = (uint8_t *)realloc(tmp, (size_t)nc);
+        if (!nb) return;
+        tmp = nb;
+        tmp_cap = nc;
+    }
     int n = crash_peek_guest(vaddr, tmp, want);
     append_fmt(buf, cap, pos,
                "%s\"%s\":{\"addr\":\"0x%08X\",\"len\":%d,\"hex\":\"",
@@ -203,7 +222,48 @@ static void append_ram_peek(char *buf, size_t cap, size_t *pos,
     append_str(buf, cap, pos, "\"}");
 }
 
-/* If the insn at $ra-8 is j/jal, return its target (live RAM, not AOT). */
+/* Same as append_ram_peek, but the region is emitted as a JSON STRING with
+ * its bytes decoded as text instead of as hex. A mod that publishes an
+ * ASCII summary into the mod arena is then readable in the run report
+ * without an external decoder. Bytes are truncated at the first NUL and
+ * anything unprintable is escaped, so the result is always valid JSON. */
+static void append_ram_text(char *buf, size_t cap, size_t *pos,
+                            const char *key, uint32_t vaddr, int want,
+                            int comma) {
+    static uint8_t *tmp;
+    static int tmp_cap;
+    if (want > tmp_cap) {
+        int nc = want < 256 ? 256 : want;
+        uint8_t *nb = (uint8_t *)realloc(tmp, (size_t)nc);
+        if (!nb) return;
+        tmp = nb;
+        tmp_cap = nc;
+    }
+    int n = crash_peek_guest(vaddr, tmp, want);
+    append_fmt(buf, cap, pos,
+               "%s\"%s\":{\"addr\":\"0x%08X\",\"len\":%d,\"text\":\"",
+               comma ? "," : "", key, vaddr, n);
+    for (int i = 0; i < n; i++) {
+        uint8_t c = tmp[i];
+        if (c == 0u) break;            /* NUL-terminated region */
+        if (c == '"' || c == '\\') {
+            append_fmt(buf, cap, pos, "\\%c", (char)c);
+        } else if (c == '\n') {
+            append_str(buf, cap, pos, "\\n");
+        } else if (c == '\r') {
+            append_str(buf, cap, pos, "\\r");
+        } else if (c == '\t') {
+            append_str(buf, cap, pos, "\\t");
+        } else if (c < 0x20u || c > 0x7Eu) {
+            append_fmt(buf, cap, pos, "\\u%04X", (unsigned)c);
+        } else {
+            append_fmt(buf, cap, pos, "%c", (char)c);
+        }
+    }
+    append_str(buf, cap, pos, "\"}");
+}
+
+/* If insn at $ra-8 is j/jal, find its target (live RAM, not AOT). */
 static uint32_t crash_jal_target_from_ra(uint32_t ra) {
     uint8_t b[4];
     uint32_t pc, insn, op;
@@ -805,6 +865,67 @@ void psx_crash_trace_dump(const char *reason, void *seh_info) {
                 psx_segment_miss_kind_name(kinds[i]));
         }
         append_str(buf, sizeof(buf), &pos, "]\n  },\n");
+    }
+
+    /* TM2 mod-arena read-outs.
+     *
+     * A trusted TM2 mod publishes a report region into the mod arena with
+     * psx_mod_alloc_guest_memory() and prints the PHYSICAL address it
+     * allocated on stderr at activation. The address is then named by an
+     * environment variable, so the report never hardcodes it. Physical is
+     * used because crash_peek_guest takes a physical address and the mod
+     * arena is KSEG0 (0x9F000000 + off -> 0x1F000000 + off).
+     *
+     *   TM2_CAPTURE_REPORT_PHYS  the PLAY-TEST PROBE's ASCII summary
+     *                            (1024 bytes). It is emitted BOTH as hex and
+     *                            as the already-decoded text, so the report
+     *                            is readable without an external decoder.
+     *   TM2_CAPTURE2_REPORT_PHYS tm2.capture's geometry-set region
+     *                            (6-word header + 8 sets x 88 = 728 bytes).
+     *
+     * Each key ends with a comma: the next top-level key in this document
+     * ("dirty_block_tail") follows, so a missing comma would produce
+     * invalid JSON the moment a region is present. */
+    {
+        const char *rp = getenv("TM2_CAPTURE_REPORT_PHYS");
+        uint32_t raddr = rp ? (uint32_t)strtoul(rp, NULL, 0) : 0u;
+        if (raddr != 0u) {
+            /* The levcap ring (tm2.levcap) publishes up to PROBE_BYTES
+             * (17024) bytes; the older play-test probe publishes only
+             * 2048. Detect the levcap magic and read the FULL region so
+             * the decisive tail events (id-11 transition, crash M/J/C/N)
+             * survive, instead of truncating at 2048. */
+            enum { kProbeLen = 2048, kLevCapLen = 17024 };
+            uint8_t magic[16];
+            int want = kProbeLen;
+            if (crash_peek_guest(raddr, magic, (int)sizeof(magic)) >= 10 &&
+                memcmp(magic, "TM2LEVCAP1", 10) == 0)
+                want = kLevCapLen;
+            append_ram_peek(buf, sizeof(buf), &pos, "tm2_capture",
+                            raddr, want, 0);
+            append_str(buf, sizeof(buf), &pos, ",\n");
+            append_ram_text(buf, sizeof(buf), &pos, "tm2_capture_text",
+                            raddr, want, 0);
+            append_str(buf, sizeof(buf), &pos, ",\n");
+        }
+    }
+    {
+        const char *rp = getenv("TM2_CAPTURE2_REPORT_PHYS");
+        uint32_t raddr = rp ? (uint32_t)strtoul(rp, NULL, 0) : 0u;
+        if (raddr != 0u) {
+            append_ram_peek(buf, sizeof(buf), &pos, "tm2_capture2",
+                            raddr, 728, 0);
+            append_str(buf, sizeof(buf), &pos, ",\n");
+        }
+    }
+    {
+        const char *rp = getenv("TM2_CAPTURE3_REPORT_PHYS");
+        uint32_t raddr = rp ? (uint32_t)strtoul(rp, NULL, 0) : 0u;
+        if (raddr != 0u) {
+            append_ram_text(buf, sizeof(buf), &pos, "tm2_capture3_text",
+                            raddr, 4096, 0);
+            append_str(buf, sizeof(buf), &pos, ",\n");
+        }
     }
 
     /* dirty_block_log tail (last 100) */

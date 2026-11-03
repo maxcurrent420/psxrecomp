@@ -525,6 +525,7 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/mod_builtin_enhanced_audio.c
     ${PSXRECOMP_ROOT}/runtime/src/mod_builtin_rewind.c
     ${PSXRECOMP_ROOT}/runtime/src/mod_builtin_internal_resolution.c
+    ${PSXRECOMP_ROOT}/runtime/src/mod_widescreen.c
     ${PSXRECOMP_ROOT}/runtime/src/mod_packages.cpp
     ${PSXRECOMP_ROOT}/runtime/src/mod_media.cpp
     ${PSXRECOMP_ROOT}/runtime/src/mod_runtime.cpp

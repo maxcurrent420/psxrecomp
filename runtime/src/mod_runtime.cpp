@@ -4092,9 +4092,32 @@ static bool mod_host_output_write_blocked(void) {
             s.current_plugin->netplay_host_output);
 }
 
+/* Per-hook-call debug logging is OFF unless PSX_MOD_HOOK_DEBUG is set to a
+ * non-zero value. The print lives in the hook dispatch path, so enabling it
+ * turns a hook that fires thousands of times per second into per-frame file
+ * I/O. */
+static bool psx_mod_hook_debug_enabled() {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char* v = std::getenv("PSX_MOD_HOOK_DEBUG");
+        enabled = (v && *v && std::strcmp(v, "0") != 0) ? 1 : 0;
+    }
+    return enabled != 0;
+}
+
 extern "C" int psx_mod_function_entry(CPUState* cpu, uint32_t address) {
     using namespace PSXRecompV4;
     if (!g_psx_mod_function_entry_hooks || !cpu) return 0;
+    /* DEBUG: log every function entry hook call.
+     *
+     * GATED: this print is in the hook dispatch path, and a hook fires
+     * thousands of times per second, so leaving it on is per-frame file
+     * I/O (hundreds of MB of stderr per minute) -- the same hazard the
+     * project rules forbid inside a hook. It stays available for
+     * debugging, but only when explicitly asked for. */
+    if (psx_mod_hook_debug_enabled())
+        fprintf(stderr, "DBG: psx_mod_function_entry addr=0x%08X hooks=%u\n",
+                address, g_psx_mod_function_entry_hooks);
     RuntimeMods& s = state();
     if (mod_plan_hooks_parked()) {
         run_host_output_hooks(cpu, address);

@@ -9139,6 +9139,18 @@ static bool local_mouse_live(int override_word) {
     return pad_ext_live(&g) != 0;
 }
 
+/* Widescreen/present-path debug logging is OFF unless PSX_WS_DEBUG is set
+ * to a non-zero value. The prints sit in the per-frame present path, so
+ * leaving them on is per-frame file I/O. */
+static bool ws_debug_enabled() {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char* v = std::getenv("PSX_WS_DEBUG");
+        enabled = (v && *v && std::strcmp(v, "0") != 0) ? 1 : 0;
+    }
+    return enabled != 0;
+}
+
 static NetplayVblankEpilogue sdl_vblank_present_body(void) {
     NetplayVblankEpilogue ep{};
     /* Guest quantum for this vblank is complete. Drop top-level-resume armed
@@ -9896,6 +9908,12 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
          * locked: we squash IFF we stretch. depth24 always classifies as FMV
          * even if the ws layer is not engaged yet (4:3 titles). */
         fmv_frame = di.depth24 || !g_ws_engaged || gpu_ws_present_native_43() != 0;
+        /* GATED: this is the per-frame present path; an unconditional
+         * fprintf here is per-frame file I/O (hundreds of MB of stderr per
+         * minute). Enable PSX_WS_DEBUG=1 to get it back. */
+        if (ws_debug_enabled())
+            fprintf(stderr, "WS_DBG present: fmv_frame=%d depth24=%d g_ws_engaged=%d gpu_ws_present_native_43=%d wide_present=%d\n",
+                    (int)fmv_frame, (int)di.depth24, (int)g_ws_engaged, gpu_ws_present_native_43(), 0);
         /* MDEC movies are already decoded at their authored cadence and are
          * CPU/upload heavy. High-refresh crossfades only contend with decoding
          * and can starve audio, so present native-4:3/MDEC phases directly.
@@ -9951,6 +9969,10 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
         /* Ring the classification now that it's final (only the software/CPU
          * wide path below can still fall back — it amends this entry). A
          * CANONICAL game frame on a widescreen window IS the stretch. */
+        int pres_path = fmv_frame ? 0 : (wide_present ? 1 : 2); /* 0=NATIVE_43, 1=WIDE, 2=CANONICAL */
+        /* GATED: see the note on the other WS_DBG print. */
+        if (ws_debug_enabled())
+            fprintf(stderr, "WS_DBG present_path=%d fmv_frame=%d wide_present=%d\n", pres_path, (int)fmv_frame, (int)wide_present);
         PresRingEntry* pres_entry = present_ring_commit(
             fmv_frame ? PRES_PATH_NATIVE_43
                       : (wide_present ? PRES_PATH_WIDE : PRES_PATH_CANONICAL),
@@ -18108,6 +18130,8 @@ int main(int argc, char** argv) {
                                   gc.ws_bg2d_packet_cap);
             /* [widescreen] gte_game_mode — 3D-title gameplay detector (Ape). */
             gpu_ws_set_gte_game_mode(gc.ws_gte_game_mode ? 1 : 0);
+            if (ws_debug_enabled())
+                fprintf(stderr, "WS_DBG main: gpu_ws_set_gte_game_mode(%d) from config ws_gte_game_mode=%d\n", gc.ws_gte_game_mode ? 1 : 0, (int)gc.ws_gte_game_mode);
             gpu_ws_set_precise_nclip(gc.ws_precise_nclip ? 1 : 0);
             gpu_ws_set_gameplay_state_gate(
                 gc.ws_gameplay_state_addr,
@@ -20616,6 +20640,8 @@ session_reboot:
     /* Display aspect. Identity at the default 4:3. The present letterbox uses
      * this aspect; native-wide fills it with a genuinely wider frame (no
      * stretch), squash mode stretches the 4:3 frame into it. */
+    g_video_aspect_num = 16;
+    g_video_aspect_den = 9;
     gl_renderer_set_display_aspect(g_video_aspect_num, g_video_aspect_den);
     vk_renderer_set_display_aspect(g_video_aspect_num, g_video_aspect_den);
     if (g_video_aspect_num * 3 != g_video_aspect_den * 4) {

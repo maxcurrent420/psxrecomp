@@ -1096,6 +1096,18 @@ static int32_t gte_h_scaled(const GTEState* gte) {
 //   IR3 FLAG = limB(MAC3_unshifted SAR 12, lm=0); stored IR3 = limB(MAC3, lm)
 //   SZ3      = limE(MAC3_unshifted SAR 12)   — always >>12, independent of sf
 // ---------------------------------------------------------------------------
+/* Widescreen debug logging is OFF unless PSX_WS_DEBUG is set to a
+ * non-zero value. These prints sit in per-frame paths, so leaving them on
+ * is per-frame file I/O. */
+static int ws_dbg_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char* v = getenv("PSX_WS_DEBUG");
+        enabled = (v && *v && strcmp(v, "0") != 0) ? 1 : 0;
+    }
+    return enabled;
+}
+
 void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0, uint32_t instr) {
     const int  shift = gte_instr_sf(instr);
     const bool lm    = gte_instr_lm(instr);
@@ -1173,6 +1185,7 @@ void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0, uint32_t instr) 
      * shadow (pgxp_project_precise) to apply the same one. */
     int64_t x_num = 1, x_den = 1;
     bool do_squash = (s_ws_xnum != s_ws_xden) && !gpu_ws_present_native_43();
+    { static int dbg_ctr = 0; if (ws_dbg_enabled() && (dbg_ctr++ % 60 == 0)) fprintf(stderr, "WS_DBG do_squash=%d s_ws_xnum=%d s_ws_xden=%d gpu_ws_present_native_43=%d\n", (int)do_squash, (int)s_ws_xnum, (int)s_ws_xden, gpu_ws_present_native_43()); }
     const bool dome_call = ws_dome_call_matches();
     // Curved backdrops are authored to cover the original 4:3 projection.
     // In classic widescreen, leave that projection intact and let the normal

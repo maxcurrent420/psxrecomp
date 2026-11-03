@@ -131,6 +131,17 @@ static int mod_memory_offset(uint32_t phys, uint32_t width, uint32_t *offset) {
     return 1;
 }
 
+/* Read bytes back out of the mod arena. Used by the run-report read-out so a
+ * mod's own guest state can be included without the mod doing any file I/O.
+ * Returns the number of bytes copied, or 0 if the range is not in the arena. */
+int psx_mod_memory_peek(uint32_t phys, uint8_t *dst, int len) {
+    uint32_t off;
+    if (len <= 0) return 0;
+    if (!mod_memory_offset(phys, (uint32_t)len, &off)) return 0;
+    memcpy(dst, mod_memory + off, (size_t)len);
+    return len;
+}
+
 uint32_t psx_mod_gpu_dma_memory_alloc(uint32_t size, uint32_t alignment) {
     uint32_t start;
     if (size == 0u) return 0u;

@@ -400,6 +400,19 @@ static uint32_t ws_ovh_count      = 0;
 static uint32_t ws_ovh_prev       = 0;  /* final count of last completed frame */
 static uint32_t ws_last_ovh_stamp = (uint32_t)-1000;
 static uint32_t ws_sust_ovh_stamp = (uint32_t)-1000;
+static int ws_dbg_frame_counter = 0;
+
+/* Widescreen debug logging is OFF unless PSX_WS_DEBUG is set to a
+ * non-zero value. These prints sit in per-frame paths, so leaving them on
+ * is per-frame file I/O. */
+static int ws_dbg_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char* v = getenv("PSX_WS_DEBUG");
+        enabled = (v && *v && strcmp(v, "0") != 0) ? 1 : 0;
+    }
+    return enabled;
+}
 
 void psx_ws_note_gte_project(int nverts) {
     uint32_t f = (uint32_t)s_frame_count;
@@ -410,8 +423,10 @@ void psx_ws_note_gte_project(int nverts) {
     }
     ws_gte_count += (uint32_t)nverts;
     ws_world_scale_note(&ws_world_scale, f, ws_gte_count);
-    if (ws_gte_game_mode_cfg && ws_gte_count >= WS_GTE_GAME_MODE_MIN_VERTS)
+    if (ws_gte_game_mode_cfg && ws_gte_count >= WS_GTE_GAME_MODE_MIN_VERTS) {
         ws_last_gte_stamp = f;
+        if (ws_dbg_enabled() && (ws_dbg_frame_counter++ % 60 == 0)) fprintf(stderr, "WS_DBG gte_project: nverts=%d gte_count=%d stamp updated to frame=%u\n", nverts, ws_gte_count, f);
+    }
     if (ws_gte_count >= WS_WORLD3D_MIN_VERTS && ws_last_world3d_stamp != f) {
         if (f == ws_last_world3d_stamp + 1u) ws_sust_world3d_stamp = f;
         ws_last_world3d_stamp = f;
@@ -434,14 +449,19 @@ static int ws_mod_world_scene(void) {
     return ws_mode == 2 && s_ws_world_scene_predicate && s_ws_world_scene_predicate();
 }
 static int ws_game_mode(void) {
-    if (ws_mod_world_scene()) return 1;
-    if (ws_local_native_split()) return 1;
-    int state_match = ws_gameplay_state_matches();
-    if (state_match >= 0) return state_match;
-    if (ws_full_2d_mode()) return 1;
-    if (ws_gte_game_mode_cfg &&
-        (uint32_t)s_frame_count - ws_last_gte_stamp <= WS_GTE_GAME_MODE_HYSTERESIS) return 1;
-    return (uint32_t)s_frame_count - ws_last_tag_stamp <= 2;
+    int result;
+    if (ws_mod_world_scene()) result = 1;
+    else if (ws_local_native_split()) result = 1;
+    else if ((result = ws_gameplay_state_matches(), result >= 0)) result = result;
+    else if (ws_full_2d_mode()) result = 1;
+    else if (ws_gte_game_mode_cfg &&
+        (uint32_t)s_frame_count - ws_last_gte_stamp <= WS_GTE_GAME_MODE_HYSTERESIS) result = 1;
+    else result = (uint32_t)s_frame_count - ws_last_tag_stamp <= 2;
+    if (ws_dbg_enabled() && (ws_dbg_frame_counter++ % 60 == 0))
+        fprintf(stderr, "WS_DBG ws_game_mode=%d gte_cfg=%d gte_stamp=%u frame=%u hysteresis=%u tag_stamp=%u\n",
+                result, ws_gte_game_mode_cfg, ws_last_gte_stamp, (uint32_t)s_frame_count,
+                WS_GTE_GAME_MODE_HYSTERESIS, ws_last_tag_stamp);
+    return result;
 }
 
 /* True when the current frame is presented at native 4:3 (NOT stretched), so
@@ -529,9 +549,8 @@ void gpu_ws_set_native_scene_predicate(int (*predicate)(void)) {
 }
 
 int gpu_ws_present_native_43(void) {
-    if (!ws_engaged()) return 0;
-    if (s_ws_native_scene_predicate && s_ws_native_scene_predicate())
-        return 1;
+    if (!ws_engaged()) { if (ws_dbg_enabled() && (ws_dbg_frame_counter++ % 60 == 0)) fprintf(stderr, "WS_DBG gpu_ws_present_native_43=0 (not engaged) frame=%u\n", (uint32_t)s_frame_count); return 0; }
+    if (s_ws_native_scene_predicate && s_ws_native_scene_predicate()) { if (ws_dbg_enabled() && (ws_dbg_frame_counter++ % 60 == 0)) fprintf(stderr, "WS_DBG gpu_ws_present_native_43=1 (native_scene_pred) frame=%u\n", (uint32_t)s_frame_count); return 1; }
     int hold_enabled = ws_mode == 2 && s_ws_retained_scene_predicate != NULL;
     int hold = hold_enabled ? s_ws_retained_scene_predicate() : PSX_MOD_SCENE_RELEASE;
     uint32_t origin = hold_enabled ? ws_display_origin() : 0;
@@ -549,16 +568,20 @@ int gpu_ws_present_native_43(void) {
     int game_mode = ws_game_mode();
     if (!game_mode) ws_scene_latch.confirmed = 0;
     int native_43 = !game_mode || ws_2d_only_scene();
-    if (!hold_enabled && native_43) return 1;      /* unchanged default */
+    if (!hold_enabled && native_43) { if (ws_dbg_enabled() && (ws_dbg_frame_counter++ % 60 == 0)) fprintf(stderr, "WS_DBG gpu_ws_present_native_43=1 (native_43=%d game_mode=%d) frame=%u\n", native_43, game_mode, (uint32_t)s_frame_count); return 1; }      /* unchanged default */
     uint32_t f = (uint32_t)s_frame_count;
     if (f != s_ws_fmv_frame_cache) {
         s_ws_fmv_frame_cache = f;
         GpuDisplayInfo di; gpu_get_display_info(&di);
         s_ws_fmv_cached = di.depth24 || mdec_recently_active(WS_FMV_HYSTERESIS);
     }
-    if (hold_enabled)
-        return ws_scene_hold_classify(&s_ws_scene_hold,
+    if (hold_enabled) {
+        int r = ws_scene_hold_classify(&s_ws_scene_hold,
             hold, native_43, s_ws_fmv_cached, origin);
+        if (ws_dbg_enabled() && (ws_dbg_frame_counter++ % 60 == 0)) fprintf(stderr, "WS_DBG gpu_ws_present_native_43=%d (hold_enabled native_43=%d game_mode=%d fmv=%d) frame=%u\n", r, native_43, game_mode, s_ws_fmv_cached, (uint32_t)s_frame_count);
+        return r;
+    }
+    if (ws_dbg_enabled() && (ws_dbg_frame_counter++ % 60 == 0)) fprintf(stderr, "WS_DBG gpu_ws_present_native_43=%d (fmv_cached native_43=%d game_mode=%d) frame=%u\n", s_ws_fmv_cached, native_43, game_mode, (uint32_t)s_frame_count);
     return s_ws_fmv_cached;
 }
 
